@@ -1,0 +1,30 @@
+{
+  "name": "floatodo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A floating Windows task timer with daily review and DeepSeek analysis.",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && node electron/dev-runner.cjs\"",
+    "dev:electron": "node electron/dev-runner.cjs",
+    "build": "tsc && vite build && tsc -p electron/tsconfig.json",
+    "preview": "vite preview --host 127.0.0.1",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^5.0.4",
+    "concurrently": "^9.2.1",
+    "electron": "^42.0.0",
+    "lucide-react": "^0.544.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.9",
+    "wait-on": "^8.0.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.0",
+    "@types/react": "^19.1.13",
+    "@types/react-dom": "^19.1.9"
+  }
+}
