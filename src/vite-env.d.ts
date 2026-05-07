@@ -20,6 +20,8 @@ type CompletedTask = Task & {
   completedAt: string;
   actualSeconds: number;
   overtimeSeconds: number;
+  status?: "completed" | "interrupted";
+  remainingEstimateMinutes?: number;
   musings?: TaskMusing[];
   musing?: string;
   reflection?: string;
@@ -73,6 +75,11 @@ interface Window {
     saveData: (data: AppData) => Promise<AppData>;
     compactWindow: () => Promise<void>;
     expandWindow: () => Promise<void>;
+    tuckWindow: (payload: { title: string; time: string; overtime: boolean }) => Promise<{ tucked: boolean; edge?: "left" | "right" | "top" | "bottom" }>;
+    untuckWindow: () => Promise<boolean>;
+    updateTuckWindow: (payload: { title: string; time: string; overtime: boolean }) => Promise<void>;
+    onTuckState: (callback: (payload: unknown) => void) => () => void;
+    onWindowUntucked: (callback: () => void) => () => void;
     minimizeWindow: () => Promise<void>;
     closeWindow: () => Promise<void>;
     setAlwaysOnTop: (value: boolean) => Promise<boolean>;

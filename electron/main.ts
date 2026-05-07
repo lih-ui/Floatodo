@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell } from "electron";
+import { app, BrowserWindow, ipcMain, screen, shell } from "electron";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 
@@ -22,6 +22,8 @@ type CompletedTask = Task & {
   completedAt: string;
   actualSeconds: number;
   overtimeSeconds: number;
+  status?: "completed" | "interrupted";
+  remainingEstimateMinutes?: number;
   musings?: TaskMusing[];
   musing?: string;
   reflection?: string;
@@ -114,7 +116,81 @@ const defaultCategoryMap = new Map(defaultData.categories.map((category) => [cat
 
 let mainWindow: BrowserWindow | null = null;
 let dogWindow: BrowserWindow | null = null;
+let tuckWindow: BrowserWindow | null = null;
 let lastDogState: unknown = { idle: "toy" };
+let untuckedMainBounds: Electron.Rectangle | null = null;
+let mainWindowTucked = false;
+let lastTuckState: unknown = { title: "Floatodo", time: "00:00", overtime: false };
+let windowAlwaysOnTop = true;
+let mainWindowMode: "compact" | "expanded" = "compact";
+
+function applyAlwaysOnTop(value = windowAlwaysOnTop) {
+  windowAlwaysOnTop = value;
+  mainWindow?.setAlwaysOnTop(value);
+  dogWindow?.setAlwaysOnTop(value);
+  tuckWindow?.setAlwaysOnTop(value);
+}
+
+function restoreMainWindow() {
+  if (!mainWindow) return false;
+  if (!untuckedMainBounds) {
+    mainWindow.setMinimumSize(340, 500);
+    mainWindow.setSize(360, 520, true);
+  } else {
+    mainWindow.setMinimumSize(340, 500);
+    mainWindow.setBounds(untuckedMainBounds, true);
+    untuckedMainBounds = null;
+  }
+  mainWindowTucked = false;
+  if (tuckWindow && !tuckWindow.isDestroyed()) tuckWindow.destroy();
+  mainWindow.show();
+  mainWindow.focus();
+  applyAlwaysOnTop();
+  mainWindow.webContents.send("window:untucked");
+  return true;
+}
+
+function dockEdge(bounds: Electron.Rectangle, gap = 18): "left" | "right" | "top" | "bottom" | null {
+  const display = screen.getDisplayMatching(bounds);
+  const area = display.workArea;
+  const distances = [
+    { edge: "left" as const, value: Math.abs(bounds.x - area.x) },
+    { edge: "right" as const, value: Math.abs(area.x + area.width - (bounds.x + bounds.width)) },
+    { edge: "top" as const, value: Math.abs(bounds.y - area.y) },
+    { edge: "bottom" as const, value: Math.abs(area.y + area.height - (bounds.y + bounds.height)) }
+  ].sort((a, b) => a.value - b.value);
+  return distances[0]?.value <= gap ? distances[0].edge : null;
+}
+
+function pointInBounds(point: Electron.Point, bounds: Electron.Rectangle) {
+  return point.x >= bounds.x && point.x <= bounds.x + bounds.width && point.y >= bounds.y && point.y <= bounds.y + bounds.height;
+}
+
+function tuckMainWindow(edge: "left" | "right" | "top" | "bottom") {
+  if (!mainWindow || mainWindowTucked) return false;
+  const bounds = mainWindow.getBounds();
+  if (bounds.width < 300 || bounds.height < 420) {
+    mainWindow.setMinimumSize(340, 500);
+    mainWindow.setSize(360, 520, true);
+    return false;
+  }
+  untuckedMainBounds = bounds;
+  mainWindow.hide();
+  mainWindowTucked = true;
+  createTuckWindow(edge, lastTuckState);
+  return true;
+}
+
+function startEdgeWatcher() {
+  setInterval(() => {
+    if (!mainWindow || mainWindow.isDestroyed() || mainWindowTucked || mainWindowMode !== "compact" || !mainWindow.isVisible()) return;
+    const bounds = mainWindow.getBounds();
+    const edge = dockEdge(bounds);
+    if (!edge) return;
+    const cursor = screen.getCursorScreenPoint();
+    if (!pointInBounds(cursor, bounds)) tuckMainWindow(edge);
+  }, 260);
+}
 
 function dataPath() {
   return path.join(app.getPath("userData"), "floatodo-data.json");
@@ -157,7 +233,7 @@ function createWindow() {
     backgroundColor: "#f5f7fb",
     transparent: false,
     resizable: false,
-    alwaysOnTop: true,
+    alwaysOnTop: windowAlwaysOnTop,
     skipTaskbar: false,
     title: "Floatodo",
     webPreferences: {
@@ -197,7 +273,7 @@ function createDogWindow() {
     transparent: true,
     backgroundColor: "#00000000",
     resizable: false,
-    alwaysOnTop: true,
+    alwaysOnTop: windowAlwaysOnTop,
     skipTaskbar: true,
     title: "Floatodo Corgi",
     webPreferences: {
@@ -219,8 +295,68 @@ function createDogWindow() {
   });
 }
 
+function createTuckWindow(edge: "left" | "right" | "top" | "bottom", state: unknown) {
+  if (tuckWindow && !tuckWindow.isDestroyed()) tuckWindow.destroy();
+
+  lastTuckState = state;
+  const display = mainWindow ? screen.getDisplayMatching(mainWindow.getBounds()) : screen.getPrimaryDisplay();
+  const area = display.workArea;
+  const vertical = edge === "left" || edge === "right";
+  const width = vertical ? 118 : 176;
+  const height = vertical ? 128 : 78;
+  const source = untuckedMainBounds ?? mainWindow?.getBounds() ?? {
+    x: area.x + area.width - 380,
+    y: area.y + 80,
+    width: 360,
+    height: 520
+  };
+  const x = edge === "left"
+    ? area.x
+    : edge === "right"
+      ? area.x + area.width - width
+      : Math.max(area.x, Math.min(source.x + 40, area.x + area.width - width));
+  const y = edge === "top"
+    ? area.y
+    : edge === "bottom"
+      ? area.y + area.height - height
+      : Math.max(area.y, Math.min(source.y + 40, area.y + area.height - height));
+
+  tuckWindow = new BrowserWindow({
+    x,
+    y,
+    width,
+    height,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    resizable: false,
+    alwaysOnTop: windowAlwaysOnTop,
+    skipTaskbar: true,
+    title: "Floatodo Timer",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+
+  const devUrl = process.env.VITE_DEV_SERVER_URL ?? "http://127.0.0.1:5173";
+  if (!app.isPackaged) {
+    void tuckWindow.loadURL(`${devUrl}?tuckWindow=1&edge=${edge}`);
+  } else {
+    void tuckWindow.loadFile(path.join(__dirname, "../dist/index.html"), { query: { tuckWindow: "1", edge } });
+  }
+
+  tuckWindow.webContents.once("did-finish-load", () => {
+    tuckWindow?.webContents.send("window:tuckState", lastTuckState);
+    tuckWindow?.showInactive();
+  });
+}
+
 app.whenReady().then(() => {
   createWindow();
+  startEdgeWatcher();
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -239,13 +375,41 @@ ipcMain.handle("data:save", async (_event, data: AppData) => {
 });
 
 ipcMain.handle("window:compact", () => {
+  untuckedMainBounds = null;
+  mainWindowTucked = false;
+  mainWindowMode = "compact";
+  if (tuckWindow && !tuckWindow.isDestroyed()) tuckWindow.destroy();
+  mainWindow?.show();
   mainWindow?.setMinimumSize(340, 500);
   mainWindow?.setSize(360, 520, true);
+  applyAlwaysOnTop();
 });
 
 ipcMain.handle("window:expanded", () => {
+  untuckedMainBounds = null;
+  mainWindowTucked = false;
+  mainWindowMode = "expanded";
+  if (tuckWindow && !tuckWindow.isDestroyed()) tuckWindow.destroy();
+  mainWindow?.show();
   mainWindow?.setMinimumSize(900, 680);
   mainWindow?.setSize(1060, 760, true);
+  applyAlwaysOnTop();
+});
+
+ipcMain.handle("window:tuck", (_event, state: unknown) => {
+  lastTuckState = state;
+  if (!mainWindow) return { tucked: false };
+  const edge = dockEdge(mainWindow.getBounds(), 24);
+  return { tucked: Boolean(edge && tuckMainWindow(edge)), edge: edge ?? undefined };
+});
+
+ipcMain.handle("window:untuck", () => {
+  return restoreMainWindow();
+});
+
+ipcMain.handle("window:tuckUpdate", (_event, state: unknown) => {
+  lastTuckState = state;
+  if (tuckWindow && !tuckWindow.isDestroyed()) tuckWindow.webContents.send("window:tuckState", state);
 });
 
 ipcMain.handle("window:minimize", () => {
@@ -257,13 +421,12 @@ ipcMain.handle("window:close", () => {
 });
 
 ipcMain.handle("window:setAlwaysOnTop", (_event, value: boolean) => {
-  mainWindow?.setAlwaysOnTop(value);
-  dogWindow?.setAlwaysOnTop(value);
-  return mainWindow?.isAlwaysOnTop() ?? value;
+  applyAlwaysOnTop(value);
+  return windowAlwaysOnTop;
 });
 
 ipcMain.handle("window:isAlwaysOnTop", () => {
-  return mainWindow?.isAlwaysOnTop() ?? false;
+  return windowAlwaysOnTop;
 });
 
 ipcMain.handle("dog:show", () => {
@@ -272,8 +435,8 @@ ipcMain.handle("dog:show", () => {
 });
 
 ipcMain.handle("dog:setAlwaysOnTop", (_event, value: boolean) => {
-  dogWindow?.setAlwaysOnTop(value);
-  return dogWindow?.isAlwaysOnTop() ?? value;
+  applyAlwaysOnTop(value);
+  return windowAlwaysOnTop;
 });
 
 ipcMain.handle("dog:reward", (_event, reward: unknown) => {

@@ -75,6 +75,10 @@
   gap: 9px;
 }
 
+.compact-controls-three {
+  grid-template-columns: 1fr 0.9fr 1fr;
+}
+
 .musing-box {
   min-height: 0;
   display: flex;
@@ -233,7 +237,8 @@ body {
   background: transparent;
 }
 
-body:has(.dog-window) {
+body:has(.dog-window),
+body:has(.tuck-strip-window) {
   min-width: 0;
   min-height: 0;
 }
@@ -330,6 +335,7 @@ textarea {
   display: flex;
   gap: 6px;
   -webkit-app-region: no-drag;
+  pointer-events: auto;
 }
 
 .window-actions button {
@@ -338,6 +344,15 @@ textarea {
   padding: 0;
   border-radius: 7px;
   background: transparent;
+  -webkit-app-region: no-drag;
+  pointer-events: auto;
+}
+
+.window-actions *,
+.titlebar button,
+.titlebar svg {
+  -webkit-app-region: no-drag;
+  pointer-events: auto;
 }
 
 .window-actions .active-tool {
@@ -1280,6 +1295,11 @@ textarea {
   white-space: nowrap;
 }
 
+.warn {
+  color: #b45309;
+  white-space: nowrap;
+}
+
 .ai-box,
 .settings-box {
   border-top: 1px solid #edf1f7;
@@ -1601,5 +1621,95 @@ textarea {
   background: rgb(246 250 255 / 86%);
   border-top: 1px solid #e7edf6;
   padding-top: 10px;
+}
+
+.app-shell.tucked {
+  min-height: 0;
+  border-radius: 14px;
+  background: rgb(255 250 242 / 96%);
+  box-shadow: 0 12px 36px rgb(86 63 38 / 18%);
+}
+
+.app-shell.tucked .titlebar,
+.app-shell.tucked .compact-view,
+.app-shell.tucked .expanded-workspace {
+  display: none;
+}
+
+.tucked-timer {
+  width: 100vw;
+  height: 100vh;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 5px;
+  padding: 10px;
+  background:
+    radial-gradient(circle at 80% 10%, rgb(245 158 11 / 18%), transparent 46%),
+    linear-gradient(180deg, #fffaf1, #f7fbff);
+  color: #172033;
+  overflow: hidden;
+}
+
+.tucked-left .tucked-timer {
+  width: 96px;
+  margin-left: auto;
+}
+
+.tucked-right .tucked-timer {
+  width: 96px;
+  margin-right: auto;
+}
+
+.tucked-top .tucked-timer {
+  height: 78px;
+  margin-top: auto;
+}
+
+.tucked-bottom .tucked-timer {
+  height: 78px;
+  margin-bottom: auto;
+}
+
+.tucked-timer span {
+  width: 100%;
+  color: #667085;
+  font-size: 11px;
+  font-weight: 800;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tucked-timer strong {
+  color: #111827;
+  font-size: 26px;
+  line-height: 1;
+  letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.tucked-timer strong.overtime {
+  color: #dc2626;
+}
+
+.tucked-timer small {
+  color: #9a7b5b;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.tuck-strip-window {
+  width: 100vw;
+  height: 100vh;
+  padding: 0;
+  background: transparent;
+}
+
+.tuck-strip-window .tucked-timer {
+  border: 1px solid rgb(255 255 255 / 80%);
+  border-radius: 14px;
+  box-shadow: 0 12px 36px rgb(86 63 38 / 20%);
 }
 
