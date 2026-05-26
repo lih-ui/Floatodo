@@ -1,4 +1,6 @@
 import { app, BrowserWindow, ipcMain, screen, shell } from "electron";
+import { randomUUID } from "node:crypto";
+import * as http from "node:http";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 
@@ -22,17 +24,38 @@ type CompletedTask = Task & {
   completedAt: string;
   actualSeconds: number;
   overtimeSeconds: number;
-  status?: "completed" | "interrupted";
+  status?: "completed" | "overtime" | "interrupted";
   remainingEstimateMinutes?: number;
   musings?: TaskMusing[];
   musing?: string;
   reflection?: string;
+  interruptedAt?: string;
+  interruptionReason?: "app_closed" | "reload" | "unexpected_exit";
 };
 
 type TaskMusing = {
   id: string;
   text: string;
   createdAt: string;
+};
+
+type ActiveTaskSession = {
+  taskId: string;
+  title: string;
+  categoryId: string;
+  plannedMinutes: number;
+  task: Task;
+  startedAt: string;
+  lastHeartbeatAt: string;
+  elapsedMs: number;
+  status: "running" | "paused";
+  musings: TaskMusing[];
+  musingDraft: string;
+  pausedSeconds: number;
+  pausedAt?: string;
+  resumedAt?: string;
+  lastTickAt?: string;
+  estimatedRemainingMs?: number;
 };
 
 type AppSettings = {
@@ -62,6 +85,18 @@ type QuickTask = {
   categoryId: string;
 };
 
+type DailyReview = {
+  date: string;
+  content: string;
+  generatedAt: string;
+  model: string;
+  feedback?: {
+    type: "positive" | "negative";
+    comment?: string;
+    updatedAt: string;
+  };
+};
+
 type AppData = {
   tasks: Task[];
   completedTasks: CompletedTask[];
@@ -69,6 +104,24 @@ type AppData = {
   settings: AppSettings;
   dog: DogProfile;
   quickTasks: QuickTask[];
+  activeSessions?: ActiveTaskSession[];
+  dailyReviews?: Record<string, DailyReview>;
+};
+
+type AgentAddMusingAction = {
+  type: "add-musing";
+  requestId: string;
+  content: string;
+  source: string;
+};
+
+type AgentActionResult = {
+  requestId: string;
+  ok: boolean;
+  action?: "add-musing";
+  taskId?: string;
+  createdAt?: string;
+  error?: string;
 };
 
 const defaultData: AppData = {
@@ -107,6 +160,8 @@ const defaultData: AppData = {
     social: 10,
     care: 50
   },
+  activeSessions: [],
+  dailyReviews: {},
   quickTasks: [
     { id: "break-5", title: "休息", estimateMinutes: 5, categoryId: "leisure" }
   ]
@@ -121,23 +176,61 @@ let lastDogState: unknown = { idle: "toy" };
 let untuckedMainBounds: Electron.Rectangle | null = null;
 let mainWindowTucked = false;
 let lastTuckState: unknown = { title: "Floatodo", time: "00:00", overtime: false };
-let windowAlwaysOnTop = true;
+let mainAlwaysOnTop = true;
+let dogAlwaysOnTop = true;
 let mainWindowMode: "compact" | "expanded" = "compact";
+let agentStatusSnapshot: unknown = {
+  app: "Floatodo",
+  generatedAt: new Date().toISOString(),
+  ready: false,
+  message: "Floatodo is starting"
+};
+let statusServer: http.Server | null = null;
+const pendingAgentActions = new Map<string, (result: AgentActionResult) => void>();
+const COMPACT_WINDOW_WIDTH = 560;
+const COMPACT_WINDOW_HEIGHT = 820;
+const COMPACT_WINDOW_MIN_WIDTH = 520;
+const COMPACT_WINDOW_MIN_HEIGHT = 760;
 
-function applyAlwaysOnTop(value = windowAlwaysOnTop) {
-  windowAlwaysOnTop = value;
-  mainWindow?.setAlwaysOnTop(value);
-  dogWindow?.setAlwaysOnTop(value);
-  tuckWindow?.setAlwaysOnTop(value);
+function safeSetAlwaysOnTop(win: BrowserWindow | null, value: boolean, name: string) {
+  if (!win || win.isDestroyed()) return;
+  try {
+    win.setAlwaysOnTop(value, "floating");
+  } catch (error) {
+    console.error(`[Floatodo] failed to set ${name} alwaysOnTop`, error);
+  }
+}
+
+function applyMainAlwaysOnTop(value = mainAlwaysOnTop) {
+  mainAlwaysOnTop = value;
+  safeSetAlwaysOnTop(mainWindow, value, "mainWindow");
+  safeSetAlwaysOnTop(tuckWindow, value, "tuckWindow");
+}
+
+function applyDogAlwaysOnTop(value = dogAlwaysOnTop) {
+  dogAlwaysOnTop = value;
+  safeSetAlwaysOnTop(dogWindow, value, "dogWindow");
+}
+
+function clampWindowToWorkArea(win: BrowserWindow | null) {
+  if (!win || win.isDestroyed()) return;
+  const bounds = win.getBounds();
+  const area = screen.getDisplayMatching(bounds).workArea;
+  const maxX = area.x + Math.max(0, area.width - bounds.width);
+  const maxY = area.y + Math.max(0, area.height - bounds.height);
+  const x = Math.max(area.x, Math.min(bounds.x, maxX));
+  const y = Math.max(area.y, Math.min(bounds.y, maxY));
+  if (x === bounds.x && y === bounds.y) return;
+  win.setBounds({ ...bounds, x, y });
 }
 
 function restoreMainWindow() {
   if (!mainWindow) return false;
   if (!untuckedMainBounds) {
-    mainWindow.setMinimumSize(340, 500);
-    mainWindow.setSize(360, 520, true);
+    mainWindow.setMinimumSize(COMPACT_WINDOW_MIN_WIDTH, COMPACT_WINDOW_MIN_HEIGHT);
+    mainWindow.setSize(COMPACT_WINDOW_WIDTH, COMPACT_WINDOW_HEIGHT, true);
   } else {
-    mainWindow.setMinimumSize(340, 500);
+    mainWindow.setMinimumSize(COMPACT_WINDOW_MIN_WIDTH, COMPACT_WINDOW_MIN_HEIGHT);
     mainWindow.setBounds(untuckedMainBounds, true);
     untuckedMainBounds = null;
   }
@@ -145,7 +238,8 @@ function restoreMainWindow() {
   if (tuckWindow && !tuckWindow.isDestroyed()) tuckWindow.destroy();
   mainWindow.show();
   mainWindow.focus();
-  applyAlwaysOnTop();
+  applyMainAlwaysOnTop();
+  clampWindowToWorkArea(mainWindow);
   mainWindow.webContents.send("window:untucked");
   return true;
 }
@@ -169,9 +263,9 @@ function pointInBounds(point: Electron.Point, bounds: Electron.Rectangle) {
 function tuckMainWindow(edge: "left" | "right" | "top" | "bottom") {
   if (!mainWindow || mainWindowTucked) return false;
   const bounds = mainWindow.getBounds();
-  if (bounds.width < 300 || bounds.height < 420) {
-    mainWindow.setMinimumSize(340, 500);
-    mainWindow.setSize(360, 520, true);
+  if (bounds.width < COMPACT_WINDOW_MIN_WIDTH || bounds.height < COMPACT_WINDOW_MIN_HEIGHT) {
+    mainWindow.setMinimumSize(COMPACT_WINDOW_MIN_WIDTH, COMPACT_WINDOW_MIN_HEIGHT);
+    mainWindow.setSize(COMPACT_WINDOW_WIDTH, COMPACT_WINDOW_HEIGHT, true);
     return false;
   }
   untuckedMainBounds = bounds;
@@ -197,8 +291,9 @@ function dataPath() {
 }
 
 async function readData(): Promise<AppData> {
+  const file = dataPath();
   try {
-    const raw = await fs.readFile(dataPath(), "utf8");
+    const raw = await fs.readFile(file, "utf8");
     const parsed = JSON.parse(raw) as Partial<AppData>;
     return {
       ...defaultData,
@@ -209,11 +304,21 @@ async function readData(): Promise<AppData> {
       settings: { ...defaultData.settings, ...parsed.settings },
       dog: { ...defaultData.dog, ...parsed.dog },
       quickTasks: parsed.quickTasks?.length ? parsed.quickTasks : defaultData.quickTasks,
+      activeSessions: parsed.activeSessions ?? [],
+      dailyReviews: parsed.dailyReviews ?? {},
       tasks: parsed.tasks ?? [],
       completedTasks: parsed.completedTasks ?? []
     };
-  } catch {
-    await writeData(defaultData);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      await writeData(defaultData);
+      return defaultData;
+    }
+    try {
+      await fs.rename(file, `${file}.broken-${Date.now()}.bak`);
+    } catch (backupError) {
+      console.warn("[Floatodo] failed to back up broken data file", backupError);
+    }
     return defaultData;
   }
 }
@@ -223,17 +328,146 @@ async function writeData(data: AppData) {
   await fs.writeFile(dataPath(), JSON.stringify(data, null, 2), "utf8");
 }
 
+function writeJson(response: http.ServerResponse, statusCode: number, body: unknown) {
+  response.writeHead(statusCode, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Access-Control-Allow-Origin": "http://127.0.0.1:39876"
+  });
+  response.end(JSON.stringify(body, null, 2));
+}
+
+function readJsonBody(request: http.IncomingMessage, maxBytes = 8192): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    request.on("data", chunk => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buffer.length;
+      if (total > maxBytes) {
+        reject(new Error("REQUEST_BODY_TOO_LARGE"));
+        return;
+      }
+      chunks.push(buffer);
+    });
+    request.on("end", () => {
+      try {
+        const raw = Buffer.concat(chunks).toString("utf8");
+        resolve(raw ? JSON.parse(raw) : {});
+      } catch {
+        reject(new Error("INVALID_JSON"));
+      }
+    });
+    request.on("error", reject);
+  });
+}
+
+function normalizeAgentSource(value: unknown) {
+  const source = typeof value === "string" && value.trim() ? value.trim() : "external-agent";
+  return source.slice(0, 80);
+}
+
+function dispatchAgentAction(action: AgentAddMusingAction): Promise<AgentActionResult> {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return Promise.resolve({ requestId: action.requestId, ok: false, error: "APP_NOT_READY" });
+  }
+  return new Promise(resolve => {
+    const timeout = setTimeout(() => {
+      pendingAgentActions.delete(action.requestId);
+      resolve({ requestId: action.requestId, ok: false, error: "ACTION_TIMEOUT" });
+    }, 5000);
+    pendingAgentActions.set(action.requestId, result => {
+      clearTimeout(timeout);
+      resolve(result);
+    });
+    mainWindow?.webContents.send("agent:action", action);
+  });
+}
+
+async function handleAddMusingAction(request: http.IncomingMessage, response: http.ServerResponse) {
+  if (request.method !== "POST") {
+    writeJson(response, 405, { ok: false, error: "METHOD_NOT_ALLOWED" });
+    return;
+  }
+  let body: unknown;
+  try {
+    body = await readJsonBody(request);
+  } catch (error) {
+    writeJson(response, 400, { ok: false, error: error instanceof Error ? error.message : "INVALID_REQUEST" });
+    return;
+  }
+  const payload = body && typeof body === "object" ? body as Record<string, unknown> : {};
+  const content = typeof payload.content === "string" ? payload.content.trim() : "";
+  if (!content) {
+    writeJson(response, 400, { ok: false, error: "INVALID_CONTENT" });
+    return;
+  }
+  if (content.length > 500) {
+    writeJson(response, 400, { ok: false, error: "CONTENT_TOO_LONG" });
+    return;
+  }
+  const result = await dispatchAgentAction({
+    type: "add-musing",
+    requestId: randomUUID(),
+    content,
+    source: normalizeAgentSource(payload.source)
+  });
+  writeJson(response, result.ok ? 200 : 409, result.requestId
+    ? { ok: result.ok, action: result.action, taskId: result.taskId, createdAt: result.createdAt, error: result.error }
+    : result);
+}
+
+function startAgentStatusServer() {
+  if (statusServer) return;
+  statusServer = http.createServer((request, response) => {
+    if (request.socket.remoteAddress && !["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress)) {
+      writeJson(response, 403, { error: "forbidden" });
+      return;
+    }
+    const url = new URL(request.url ?? "/", "http://127.0.0.1:39876");
+    if (url.pathname === "/api/status") {
+      if (request.method !== "GET") {
+        writeJson(response, 405, { error: "METHOD_NOT_ALLOWED" });
+        return;
+      }
+      writeJson(response, 200, typeof agentStatusSnapshot === "object" && agentStatusSnapshot
+        ? { ...agentStatusSnapshot, currentTime: new Date().toISOString() }
+        : agentStatusSnapshot);
+      return;
+    }
+    if (url.pathname === "/api/actions/add-musing") {
+      void handleAddMusingAction(request, response).catch(error => {
+        console.error("[Floatodo] agent action failed", error);
+        writeJson(response, 500, { ok: false, error: "INTERNAL_ERROR" });
+      });
+      return;
+    }
+    if (request.method !== "GET" && request.method !== "POST") {
+      writeJson(response, 405, { error: "METHOD_NOT_ALLOWED" });
+      return;
+    }
+    writeJson(response, 404, { error: "not_found" });
+  });
+  statusServer.on("error", error => {
+    console.error("[Floatodo] agent status server failed", error);
+    statusServer = null;
+  });
+  statusServer.listen(39876, "127.0.0.1", () => {
+    console.log("[Floatodo] agent status server listening on http://127.0.0.1:39876/api/status");
+  });
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 360,
-    height: 520,
-    minWidth: 340,
-    minHeight: 500,
+    width: COMPACT_WINDOW_WIDTH,
+    height: COMPACT_WINDOW_HEIGHT,
+    minWidth: COMPACT_WINDOW_MIN_WIDTH,
+    minHeight: COMPACT_WINDOW_MIN_HEIGHT,
     frame: false,
     backgroundColor: "#f5f7fb",
     transparent: false,
     resizable: false,
-    alwaysOnTop: windowAlwaysOnTop,
+    alwaysOnTop: mainAlwaysOnTop,
     skipTaskbar: false,
     title: "Floatodo",
     webPreferences: {
@@ -242,6 +476,14 @@ function createWindow() {
       nodeIntegration: false
     }
   });
+  const createdMainWindow = mainWindow;
+  mainWindow.once("closed", () => {
+    if (mainWindow === createdMainWindow) mainWindow = null;
+  });
+  mainWindow.on("moved", () => clampWindowToWorkArea(mainWindow));
+  mainWindow.on("resized", () => clampWindowToWorkArea(mainWindow));
+  applyMainAlwaysOnTop();
+  clampWindowToWorkArea(mainWindow);
 
   const devUrl = process.env.VITE_DEV_SERVER_URL ?? "http://127.0.0.1:5173";
   mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
@@ -262,28 +504,53 @@ function createWindow() {
 }
 
 function createDogWindow() {
-  if (dogWindow && !dogWindow.isDestroyed()) return;
+  if (dogWindow && !dogWindow.isDestroyed()) return false;
+  let dogWindowShown = false;
+  const showDogWindowWhenReady = () => {
+    if (!dogWindow || dogWindow.isDestroyed() || dogWindowShown) return;
+    dogWindowShown = true;
+    applyDogAlwaysOnTop();
+    dogWindow.showInactive();
+  };
 
   dogWindow = new BrowserWindow({
     width: 300,
     height: 300,
     minWidth: 260,
     minHeight: 260,
+    show: false,
     frame: false,
     transparent: true,
     backgroundColor: "#00000000",
     resizable: false,
-    alwaysOnTop: windowAlwaysOnTop,
+    alwaysOnTop: dogAlwaysOnTop,
     skipTaskbar: true,
     title: "Floatodo Corgi",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      backgroundThrottling: false
     }
   });
+  const createdDogWindow = dogWindow;
+  dogWindow.once("closed", () => {
+    if (dogWindow === createdDogWindow) dogWindow = null;
+  });
+  applyDogAlwaysOnTop();
 
   const devUrl = process.env.VITE_DEV_SERVER_URL ?? "http://127.0.0.1:5173";
+  dogWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
+    console.error(`[Floatodo dog renderer] load failed ${errorCode}: ${errorDescription} (${validatedURL})`);
+  });
+  dogWindow.webContents.on("console-message", (_event, level, message, line, sourceId) => {
+    console.log(`[Floatodo dog renderer:${level}] ${message} (${sourceId}:${line})`);
+  });
+  dogWindow.webContents.on("render-process-gone", (_event, details) => {
+    console.error(`[Floatodo dog renderer] gone: ${details.reason}`);
+  });
+  dogWindow.once("ready-to-show", showDogWindowWhenReady);
+
   if (!app.isPackaged) {
     void dogWindow.loadURL(`${devUrl}?dogWindow=1`);
   } else {
@@ -292,7 +559,9 @@ function createDogWindow() {
 
   dogWindow.webContents.once("did-finish-load", () => {
     dogWindow?.webContents.send("dog:state", lastDogState);
+    showDogWindowWhenReady();
   });
+  return true;
 }
 
 function createTuckWindow(edge: "left" | "right" | "top" | "bottom", state: unknown) {
@@ -305,10 +574,10 @@ function createTuckWindow(edge: "left" | "right" | "top" | "bottom", state: unkn
   const width = vertical ? 118 : 176;
   const height = vertical ? 128 : 78;
   const source = untuckedMainBounds ?? mainWindow?.getBounds() ?? {
-    x: area.x + area.width - 380,
+    x: area.x + area.width - COMPACT_WINDOW_WIDTH - 20,
     y: area.y + 80,
-    width: 360,
-    height: 520
+    width: COMPACT_WINDOW_WIDTH,
+    height: COMPACT_WINDOW_HEIGHT
   };
   const x = edge === "left"
     ? area.x
@@ -331,7 +600,7 @@ function createTuckWindow(edge: "left" | "right" | "top" | "bottom", state: unkn
     transparent: true,
     backgroundColor: "#00000000",
     resizable: false,
-    alwaysOnTop: windowAlwaysOnTop,
+    alwaysOnTop: mainAlwaysOnTop,
     skipTaskbar: true,
     title: "Floatodo Timer",
     webPreferences: {
@@ -340,6 +609,11 @@ function createTuckWindow(edge: "left" | "right" | "top" | "bottom", state: unkn
       nodeIntegration: false
     }
   });
+  const createdTuckWindow = tuckWindow;
+  tuckWindow.once("closed", () => {
+    if (tuckWindow === createdTuckWindow) tuckWindow = null;
+  });
+  applyMainAlwaysOnTop();
 
   const devUrl = process.env.VITE_DEV_SERVER_URL ?? "http://127.0.0.1:5173";
   if (!app.isPackaged) {
@@ -355,6 +629,7 @@ function createTuckWindow(edge: "left" | "right" | "top" | "bottom", state: unkn
 }
 
 app.whenReady().then(() => {
+  startAgentStatusServer();
   createWindow();
   startEdgeWatcher();
 
@@ -367,11 +642,31 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-ipcMain.handle("data:load", readData);
+app.on("before-quit", () => {
+  statusServer?.close();
+  statusServer = null;
+});
+
+ipcMain.handle("data:load", async () => {
+  const data = await readData();
+  applyMainAlwaysOnTop(data.settings.alwaysOnTop ?? mainAlwaysOnTop);
+  return data;
+});
 
 ipcMain.handle("data:save", async (_event, data: AppData) => {
   await writeData(data);
   return data;
+});
+
+ipcMain.handle("agent:status", (_event, snapshot: unknown) => {
+  agentStatusSnapshot = snapshot;
+});
+
+ipcMain.handle("agent:actionResult", (_event, result: AgentActionResult) => {
+  const resolve = pendingAgentActions.get(result.requestId);
+  if (!resolve) return;
+  pendingAgentActions.delete(result.requestId);
+  resolve(result);
 });
 
 ipcMain.handle("window:compact", () => {
@@ -380,9 +675,10 @@ ipcMain.handle("window:compact", () => {
   mainWindowMode = "compact";
   if (tuckWindow && !tuckWindow.isDestroyed()) tuckWindow.destroy();
   mainWindow?.show();
-  mainWindow?.setMinimumSize(340, 500);
-  mainWindow?.setSize(360, 520, true);
-  applyAlwaysOnTop();
+  mainWindow?.setMinimumSize(COMPACT_WINDOW_MIN_WIDTH, COMPACT_WINDOW_MIN_HEIGHT);
+  mainWindow?.setSize(COMPACT_WINDOW_WIDTH, COMPACT_WINDOW_HEIGHT, true);
+  clampWindowToWorkArea(mainWindow);
+  applyMainAlwaysOnTop();
 });
 
 ipcMain.handle("window:expanded", () => {
@@ -393,12 +689,14 @@ ipcMain.handle("window:expanded", () => {
   mainWindow?.show();
   mainWindow?.setMinimumSize(900, 680);
   mainWindow?.setSize(1060, 760, true);
-  applyAlwaysOnTop();
+  clampWindowToWorkArea(mainWindow);
+  applyMainAlwaysOnTop();
 });
 
 ipcMain.handle("window:tuck", (_event, state: unknown) => {
   lastTuckState = state;
   if (!mainWindow) return { tucked: false };
+  clampWindowToWorkArea(mainWindow);
   const edge = dockEdge(mainWindow.getBounds(), 24);
   return { tucked: Boolean(edge && tuckMainWindow(edge)), edge: edge ?? undefined };
 });
@@ -421,22 +719,35 @@ ipcMain.handle("window:close", () => {
 });
 
 ipcMain.handle("window:setAlwaysOnTop", (_event, value: boolean) => {
-  applyAlwaysOnTop(value);
-  return windowAlwaysOnTop;
+  try {
+    applyMainAlwaysOnTop(value);
+  } catch (error) {
+    console.error("[Floatodo] window:setAlwaysOnTop failed", error);
+  }
+  return mainAlwaysOnTop;
 });
 
 ipcMain.handle("window:isAlwaysOnTop", () => {
-  return windowAlwaysOnTop;
+  return mainAlwaysOnTop;
 });
 
 ipcMain.handle("dog:show", () => {
-  createDogWindow();
-  dogWindow?.show();
+  const created = createDogWindow();
+  applyDogAlwaysOnTop();
+  if (!created && dogWindow && !dogWindow.isDestroyed()) dogWindow.showInactive();
 });
 
 ipcMain.handle("dog:setAlwaysOnTop", (_event, value: boolean) => {
-  applyAlwaysOnTop(value);
-  return windowAlwaysOnTop;
+  try {
+    applyDogAlwaysOnTop(value);
+  } catch (error) {
+    console.error("[Floatodo] dog:setAlwaysOnTop failed", error);
+  }
+  return dogAlwaysOnTop;
+});
+
+ipcMain.handle("dog:isAlwaysOnTop", () => {
+  return dogAlwaysOnTop;
 });
 
 ipcMain.handle("dog:reward", (_event, reward: unknown) => {
@@ -463,7 +774,7 @@ ipcMain.handle("deepseek:review", async (_event, payload: { apiKey: string; mode
       messages: [
         {
           role: "system",
-          content: "你是一位务实的个人效率教练，请基于真实任务记录给出简洁、具体、可执行的复盘。"
+          content: "你是一位温和、务实、支持型的个人复盘教练，请基于真实任务记录给出简洁、具体、可执行且不增加压力的复盘。"
         },
         {
           role: "user",

@@ -5,7 +5,7 @@
   "description": "A floating Windows task timer with daily review and DeepSeek analysis.",
   "main": "dist-electron/main.js",
   "scripts": {
-    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && node electron/dev-runner.cjs\"",
+    "dev": "concurrently -k \"node node_modules/vite/bin/vite.js --host 127.0.0.1\" \"node node_modules/wait-on/bin/wait-on tcp:5173 && node electron/dev-runner.cjs\"",
     "dev:electron": "node electron/dev-runner.cjs",
     "build": "tsc && vite build && tsc -p electron/tsconfig.json",
     "preview": "vite preview --host 127.0.0.1",

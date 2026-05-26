@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld("floatodo", {
   isAlwaysOnTop: () => ipcRenderer.invoke("window:isAlwaysOnTop"),
   showDogWindow: () => ipcRenderer.invoke("dog:show"),
   setDogAlwaysOnTop: (value: boolean) => ipcRenderer.invoke("dog:setAlwaysOnTop", value),
+  isDogAlwaysOnTop: () => ipcRenderer.invoke("dog:isAlwaysOnTop"),
   sendDogReward: (payload: unknown) => ipcRenderer.invoke("dog:reward", payload),
   onDogReward: (callback: (payload: unknown) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload);
@@ -37,5 +38,12 @@ contextBridge.exposeInMainWorld("floatodo", {
     return () => ipcRenderer.removeListener("dog:state", listener);
   },
   requestDeepSeekReview: (payload: unknown) => ipcRenderer.invoke("deepseek:review", payload),
+  updateAgentStatus: (payload: unknown) => ipcRenderer.invoke("agent:status", payload),
+  onAgentAction: (callback: (payload: unknown) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload);
+    ipcRenderer.on("agent:action", listener);
+    return () => ipcRenderer.removeListener("agent:action", listener);
+  },
+  resolveAgentAction: (payload: unknown) => ipcRenderer.invoke("agent:actionResult", payload),
   openDataFolder: () => ipcRenderer.invoke("app:openDataFolder")
 });
